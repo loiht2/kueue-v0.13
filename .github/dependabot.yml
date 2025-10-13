@@ -1,0 +1,115 @@
+version: 2
+updates:
+
+  # Maintain dependencies for go in root
+  - package-ecosystem: "gomod"
+    directories:
+      - "/"
+      - "/hack/internal/tools"
+      - "/site"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "ok-to-test"
+      - "release-note-none"
+    groups:
+      kubernetes:
+        patterns:
+          - "k8s.io/*"
+    ignore:
+      # Ignore major and minor versions for dependencies updates
+      # Allow patches and security updates.
+      - dependency-name: k8s.io/*
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # Maintain npm dependencies for site
+  - package-ecosystem: "npm"
+    directory: "/site"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "ok-to-test"
+      - "release-note-none"
+    groups:
+      all:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    labels:
+      - "ok-to-test"
+      - "release-note-none"
+    open-pull-requests-limit: 10
+    groups:
+      all:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Maintain Dockerfiles
+  - package-ecosystem: "docker"
+    directories:
+      - "/cmd/kueueviz/frontend"
+      - "/hack/agnhost"
+      - "/hack/cypress"
+      - "/hack/depcheck"
+      - "/hack/shellcheck"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "ok-to-test"
+      - "release-note-none"
+
+  # Maintain go dependencies for KueueViz backend
+  - package-ecosystem: "gomod"
+    directories:
+      - "/cmd/kueueviz/backend"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "ok-to-test"
+      - "release-note-none"
+    groups:
+      kubernetes:
+        patterns:
+          - "k8s.io/*"
+    ignore:
+      # Ignore major and minor versions for dependencies updates
+      # Allow patches and security updates.
+      - dependency-name: k8s.io/*
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # Maintain npm dependencies for KueueViz frontend
+  - package-ecosystem: "npm"
+    directory: "/cmd/kueueviz/frontend"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "ok-to-test"
+      - "release-note-none"
+    groups:
+      mui-packages:
+        patterns:
+          - "@mui/*"
+      all:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Maintain npm dependencies for KueueViz frontend cypress e2e tests
+  - package-ecosystem: "npm"
+    directory: "/test/e2e/kueueviz"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "ok-to-test"
+      - "release-note-none"
+    groups:
+      all:
+        update-types:
+          - "minor"
+          - "patch"
