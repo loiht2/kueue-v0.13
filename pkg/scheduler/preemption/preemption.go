@@ -62,7 +62,8 @@ type Preemptor struct {
 	fsStrategies      []fairsharing.Strategy
 
 	// stubs
-	applyPreemption func(ctx context.Context, w *kueue.Workload, reason, message string) error
+	applyPreemption          func(ctx context.Context, w *kueue.Workload, reason, message string) error
+	waitCheckpointCompletion func(ctx context.Context, namespace, name string) error
 }
 
 type preemptionCtx struct {
@@ -91,11 +92,16 @@ func New(
 		fsStrategies:      parseStrategies(fs.PreemptionStrategies),
 	}
 	p.applyPreemption = p.applyPreemptionWithSSA
+	p.waitCheckpointCompletion = p.waitForCheckpointCompletion
 	return p
 }
 
 func (p *Preemptor) OverrideApply(f func(context.Context, *kueue.Workload, string, string) error) {
 	p.applyPreemption = f
+}
+
+func (p *Preemptor) OverrideCheckpointWait(f func(context.Context, string, string) error) {
+	p.waitCheckpointCompletion = f
 }
 
 type Target struct {
@@ -183,6 +189,9 @@ func (p *Preemptor) IssuePreemptions(ctx context.Context, preemptor *workload.In
 }
 
 func (p *Preemptor) applyPreemptionWithSSA(ctx context.Context, w *kueue.Workload, reason, message string) error {
+	if err := p.ensureCheckpointBackup(ctx, w); err != nil {
+		return err
+	}
 	w = w.DeepCopy()
 	workload.SetPreemptedCondition(w, reason, message)
 	return workload.Evict(ctx, p.client, p.recorder, w, kueue.WorkloadEvictedByPreemption, "", message, p.clock)

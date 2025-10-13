@@ -26,10 +26,13 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
@@ -37,6 +40,7 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	config "sigs.k8s.io/kueue/apis/config/v1beta1"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
 	"sigs.k8s.io/kueue/pkg/cache"
@@ -1873,6 +1877,132 @@ func TestPreemption(t *testing.T) {
 				t.Errorf("Snapshot was modified (-initial,+end):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestApplyPreemptionWithSSACreatesCheckpointBackup(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	job := &batchv1.Job{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "batch/v1",
+			Kind:       "Job",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "demo-job",
+			Namespace: "demo",
+			UID:       types.UID("job-uid"),
+		},
+	}
+
+	wl := &kueue.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "demo-workload",
+			Namespace: "demo",
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(job, batchv1.SchemeGroupVersion.WithKind("Job")),
+			},
+		},
+		Status: kueue.WorkloadStatus{
+			Admission: &kueue.Admission{
+				ClusterQueue: "cq",
+			},
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "demo-pod",
+			Namespace:         "demo",
+			CreationTimestamp: metav1.NewTime(now),
+			Labels: map[string]string{
+				batchv1.JobNameLabel: job.Name,
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "trainer",
+					Image: "org/loiht2_test:v0.5",
+				},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	cl := utiltesting.NewFakeClientSSAAsSM(job, wl, pod)
+	recorder := record.NewFakeRecorder(1)
+	preemptor := New(cl, workload.Ordering{}, recorder, config.FairSharing{}, clocktesting.NewFakeClock(now))
+	preemptor.OverrideCheckpointWait(func(context.Context, string, string) error { return nil })
+
+	if err := preemptor.applyPreemptionWithSSA(ctx, wl, kueue.InClusterQueueReason, "test preemption"); err != nil {
+		t.Fatalf("applyPreemptionWithSSA returned error: %v", err)
+	}
+
+	backup := &unstructured.Unstructured{}
+	backup.SetGroupVersionKind(schema.GroupVersionKind{Group: "migration.dcnlab.com", Version: "v1", Kind: checkpointBackupKind})
+	if err := cl.Get(ctx, client.ObjectKey{Name: checkpointBackupName(wl.Name), Namespace: job.Namespace}, backup); err != nil {
+		t.Fatalf("expected CheckpointBackup to be created: %v", err)
+	}
+
+	if got := backup.GetLabels()["kueue.x-k8s.io/workload-name"]; got != wl.Name {
+		t.Errorf("CheckpointBackup labels mismatch, got %q, want %q", got, wl.Name)
+	}
+
+	spec, ok := backup.Object["spec"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("CheckpointBackup spec has unexpected type: %T", backup.Object["spec"])
+	}
+
+	if schedule := spec["schedule"]; schedule != checkpointBackupSchedule {
+		t.Errorf("unexpected schedule, got %v, want %s", schedule, checkpointBackupSchedule)
+	}
+
+	if stopPod, ok := spec["stopPod"].(bool); !ok || stopPod {
+		t.Errorf("unexpected stopPod, got %v, want false", spec["stopPod"])
+	}
+
+	podRef, ok := spec["podRef"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("podRef has unexpected type: %T", spec["podRef"])
+	}
+	if name := podRef["name"]; name != pod.Name {
+		t.Errorf("unexpected podRef name, got %v, want %s", name, pod.Name)
+	}
+	if namespace := podRef["namespace"]; namespace != pod.Namespace {
+		t.Errorf("unexpected podRef namespace, got %v, want %s", namespace, pod.Namespace)
+	}
+
+	resourceRef, ok := spec["resourceRef"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("resourceRef has unexpected type: %T", spec["resourceRef"])
+	}
+	if name := resourceRef["name"]; name != job.Name {
+		t.Errorf("unexpected resourceRef name, got %v, want %s", name, job.Name)
+	}
+	if namespace := resourceRef["namespace"]; namespace != job.Namespace {
+		t.Errorf("unexpected resourceRef namespace, got %v, want %s", namespace, job.Namespace)
+	}
+
+	containers, ok := spec["containers"].([]interface{})
+	if !ok {
+		t.Fatalf("containers has unexpected type: %T", spec["containers"])
+	}
+	if len(containers) != 1 {
+		t.Fatalf("unexpected containers length, got %d, want 1", len(containers))
+	}
+	container, ok := containers[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("container has unexpected type: %T", containers[0])
+	}
+	if name := container["name"]; name != "trainer" {
+		t.Errorf("unexpected container name, got %v, want trainer", name)
+	}
+	if image := container["image"]; image != "checkpoint/loiht2_test:v0.5" {
+		t.Errorf("unexpected container image, got %v, want checkpoint/loiht2_test:v0.5", image)
 	}
 }
 
