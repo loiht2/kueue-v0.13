@@ -63,7 +63,7 @@ type Preemptor struct {
 
 	// stubs
 	applyPreemption          func(ctx context.Context, w *kueue.Workload, reason, message string) error
-	waitCheckpointCompletion func(ctx context.Context, namespace, name string) error
+	waitCheckpointCompletion func(ctx context.Context, namespace, name string) (string, error)
 }
 
 type preemptionCtx struct {
@@ -100,7 +100,7 @@ func (p *Preemptor) OverrideApply(f func(context.Context, *kueue.Workload, strin
 	p.applyPreemption = f
 }
 
-func (p *Preemptor) OverrideCheckpointWait(f func(context.Context, string, string) error) {
+func (p *Preemptor) OverrideCheckpointWait(f func(context.Context, string, string) (string, error)) {
 	p.waitCheckpointCompletion = f
 }
 

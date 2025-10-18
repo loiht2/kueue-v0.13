@@ -1936,7 +1936,7 @@ func TestApplyPreemptionWithSSACreatesCheckpointBackup(t *testing.T) {
 	cl := utiltesting.NewFakeClientSSAAsSM(job, wl, pod)
 	recorder := record.NewFakeRecorder(1)
 	preemptor := New(cl, workload.Ordering{}, recorder, config.FairSharing{}, clocktesting.NewFakeClock(now))
-	preemptor.OverrideCheckpointWait(func(context.Context, string, string) error { return nil })
+	preemptor.OverrideCheckpointWait(func(context.Context, string, string) (string, error) { return checkpointPhaseCheckpointed, nil })
 
 	if err := preemptor.applyPreemptionWithSSA(ctx, wl, kueue.InClusterQueueReason, "test preemption"); err != nil {
 		t.Fatalf("applyPreemptionWithSSA returned error: %v", err)

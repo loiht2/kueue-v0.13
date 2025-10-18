@@ -40,7 +40,7 @@ const (
 	checkpointPhaseCompletedPodDeleted = "CompletedPodDeleted"
 	checkpointPhaseFailed              = "Failed"
 	checkpointWaitInterval             = 2 * time.Second
-	checkpointWaitTimeout              = 2 * time.Minute
+	checkpointWaitTimeout              = 10 * time.Minute
 )
 
 func (p *Preemptor) ensureCheckpointBackup(ctx context.Context, w *kueue.Workload) error {
@@ -68,22 +68,30 @@ func (p *Preemptor) ensureCheckpointBackup(ctx context.Context, w *kueue.Workloa
 		Kind:    checkpointBackupKind,
 	})
 	if err := p.client.Get(ctx, client.ObjectKey{Name: backupName, Namespace: job.Namespace}, existing); err == nil {
-		log.V(4).Info("CheckpointBackup already exists", "name", backupName, "namespace", job.Namespace)
-		return p.waitCheckpointCompletion(ctx, job.Namespace, backupName)
+		log.Info("CheckpointBackup already exists", "name", backupName, "namespace", job.Namespace)
+		if _, err := p.waitCheckpointCompletion(ctx, job.Namespace, backupName); err != nil {
+			return err
+		}
+		return nil
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("checking existing CheckpointBackup %s/%s: %w", job.Namespace, backupName, err)
 	}
 
-	pod, err := p.selectJobPod(ctx, job)
+	pod, err := p.selectRunningJobPod(ctx, job)
 	if err != nil {
 		return err
 	}
+	if pod == nil {
+		log.Info("Skipping checkpoint creation; no running pod found for job", "job", klog.KRef(job.Namespace, job.Name))
+		return nil
+	}
 
+	checkpointImage := fmt.Sprintf("checkpoint/preemption:%s", pod.Name)
 	containers := make([]interface{}, 0, len(pod.Spec.Containers))
-	for range pod.Spec.Containers {
+	for _, c := range pod.Spec.Containers {
 		containers = append(containers, map[string]interface{}{
-			"name":  pod.Name,
-			"image": fmt.Sprintf("checkpoint/%s-is-checkpointed", pod.Name),
+			"name":  c.Name,
+			"image": checkpointImage,
 		})
 	}
 
@@ -131,55 +139,65 @@ func (p *Preemptor) ensureCheckpointBackup(ctx context.Context, w *kueue.Workloa
 
 	if err := p.client.Create(ctx, backup); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			log.V(4).Info("CheckpointBackup already exists on create", "name", backupName, "namespace", job.Namespace)
-			return p.waitCheckpointCompletion(ctx, job.Namespace, backupName)
+			log.Info("CheckpointBackup already exists on create", "name", backupName, "namespace", job.Namespace)
+			if _, waitErr := p.waitCheckpointCompletion(ctx, job.Namespace, backupName); waitErr != nil {
+				return waitErr
+			}
+			return nil
 		}
 		return fmt.Errorf("creating CheckpointBackup %s/%s: %w", job.Namespace, backupName, err)
 	}
-	log.V(3).Info("Created CheckpointBackup for preempted workload", "workload", klog.KObj(w), "checkpointBackup", klog.KRef(job.Namespace, backupName))
-	return p.waitCheckpointCompletion(ctx, job.Namespace, backupName)
+	log.Info("Created CheckpointBackup for preempted workload", "workload", klog.KObj(w), "checkpointBackup", klog.KRef(job.Namespace, backupName))
+	_, err = p.waitCheckpointCompletion(ctx, job.Namespace, backupName)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
-func (p *Preemptor) selectJobPod(ctx context.Context, job *batchv1.Job) (*corev1.Pod, error) {
+func (p *Preemptor) selectRunningJobPod(ctx context.Context, job *batchv1.Job) (*corev1.Pod, error) {
 	podList := &corev1.PodList{}
 	if err := p.client.List(ctx, podList, client.InNamespace(job.Namespace), client.MatchingLabels(map[string]string{batchv1.JobNameLabel: job.Name})); err != nil {
 		return nil, fmt.Errorf("listing pods for job %s/%s: %w", job.Namespace, job.Name, err)
 	}
 	if len(podList.Items) == 0 {
-		return nil, fmt.Errorf("no pods found for job %s/%s", job.Namespace, job.Name)
+		return nil, nil
 	}
 
-	var running, pending, fallback *corev1.Pod
+	var running *corev1.Pod
 	for i := range podList.Items {
 		pod := &podList.Items[i]
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
-		switch pod.Status.Phase {
-		case corev1.PodRunning:
+	if pod.Status.Phase == corev1.PodRunning && podAllContainersRunning(pod) {
 			if running == nil || pod.CreationTimestamp.After(running.CreationTimestamp.Time) {
 				running = pod
 			}
-		case corev1.PodPending:
-			if pending == nil || pod.CreationTimestamp.After(pending.CreationTimestamp.Time) {
-				pending = pod
-			}
-		default:
-			if fallback == nil || pod.CreationTimestamp.After(fallback.CreationTimestamp.Time) {
-				fallback = pod
-			}
 		}
 	}
-	if running != nil {
-		return running, nil
+	return running, nil
+}
+
+func podAllContainersRunning(pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodRunning {
+		return false
 	}
-	if pending != nil {
-		return pending, nil
+	statuses := pod.Status.ContainerStatuses
+	if len(statuses) < len(pod.Spec.Containers) {
+		return false
 	}
-	if fallback != nil {
-		return fallback, nil
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status != corev1.ConditionTrue {
+			return false
+		}
 	}
-	return nil, fmt.Errorf("no suitable pods found for job %s/%s", job.Namespace, job.Name)
+	for _, cs := range statuses {
+		if cs.Ready != true || cs.State.Running == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func checkpointBackupName(workloadName string) string {
@@ -195,9 +213,10 @@ func checkpointBackupName(workloadName string) string {
 	return name
 }
 
-func (p *Preemptor) waitForCheckpointCompletion(ctx context.Context, namespace, name string) error {
+func (p *Preemptor) waitForCheckpointCompletion(ctx context.Context, namespace, name string) (string, error) {
 	log := ctrl.LoggerFrom(ctx)
-	return wait.PollUntilContextTimeout(ctx, checkpointWaitInterval, checkpointWaitTimeout, true, func(ctx context.Context) (bool, error) {
+	var resultPhase string
+	err := wait.PollUntilContextTimeout(ctx, checkpointWaitInterval, checkpointWaitTimeout, true, func(ctx context.Context) (bool, error) {
 		backup := &unstructured.Unstructured{}
 		backup.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   "migration.dcnlab.com",
@@ -206,7 +225,7 @@ func (p *Preemptor) waitForCheckpointCompletion(ctx context.Context, namespace, 
 		})
 		if err := p.client.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, backup); err != nil {
 			if apierrors.IsNotFound(err) {
-				log.V(4).Info("CheckpointBackup not found yet", "name", name, "namespace", namespace)
+		log.V(4).Info("CheckpointBackup not found yet", "name", name, "namespace", namespace)
 				return false, nil
 			}
 			return false, err
@@ -221,20 +240,26 @@ func (p *Preemptor) waitForCheckpointCompletion(ctx context.Context, namespace, 
 			return false, nil
 		}
 		switch phase {
-		case checkpointPhaseCheckpointed,
-			checkpointPhaseImageBuilding,
-			checkpointPhaseImageBuilt,
-			checkpointPhaseImagePushing,
-			checkpointPhaseImagePushed,
+		case checkpointPhaseImagePushed,
 			checkpointPhaseCompleted,
 			checkpointPhaseCompletedPodDeleted:
-			log.V(3).Info("CheckpointBackup completed phase", "name", name, "namespace", namespace, "phase", phase)
+			log.Info("CheckpointBackup completed phase", "name", name, "namespace", namespace, "phase", phase)
+			resultPhase = phase
 			return true, nil
+	case checkpointPhaseCheckpointed,
+		checkpointPhaseImageBuilding,
+		checkpointPhaseImageBuilt,
+		checkpointPhaseImagePushing:
+			log.Info("CheckpointBackup progressing", "name", name, "namespace", namespace, "phase", phase)
+			return false, nil
 		case checkpointPhaseFailed:
-			return false, fmt.Errorf("checkpoint backup %s/%s failed", namespace, name)
+			log.Info("CheckpointBackup failed; proceeding without updated image", "name", name, "namespace", namespace)
+			resultPhase = phase
+			return true, nil
 		default:
-			log.V(4).Info("CheckpointBackup progressing", "name", name, "namespace", namespace, "phase", phase)
+			log.Info("CheckpointBackup progressing", "name", name, "namespace", namespace, "phase", phase)
 			return false, nil
 		}
 	})
+	return resultPhase, err
 }
