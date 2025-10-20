@@ -15,19 +15,19 @@
   "dependencies": {
     "@emotion/react": "^11.14.0",
     "@emotion/styled": "^11.14.1",
-    "@mui/icons-material": "^7.2.0",
+    "@mui/icons-material": "^7.3.4",
     "@mui/material": "^7.2.0",
-    "ace-builds": "^1.43.2",
-    "react": "^19.1.0",
+    "ace-builds": "^1.43.4",
+    "react": "^19.2.0",
     "react-ace": "^14.0.1",
-    "react-dom": "^19.0.0",
-    "react-router-dom": "^7.7.0",
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^7.9.4",
     "react-toastify": "^11.0.5"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.7.0",
     "depcheck": "^1.4.7",
-    "vite": "^7.0.5"
+    "vite": "^7.1.11"
   },
   "browserslist": {
     "production": [
